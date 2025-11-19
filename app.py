@@ -1,117 +1,155 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta, timezone
+from sklearn.ensemble import GradientBoostingRegressor, IsolationForest
 from sklearn.metrics import mean_absolute_error
-from datetime import datetime, timedelta
-# Import your trained pipeline and functions
-# from model_pipeline import pipeline
-# from feature_engineering import add_lag_features
-# from forecast_functions import recursive_forecast
-# from data_fetch import fetch_openaq_pm25, fetch_open_meteo_pm25, fetch_weather
+import requests
 
-st.set_page_config(page_title="Live PM2.5 Forecast", layout="wide")
-st.title("🌫️ Live PM2.5 Nowcast & Forecast Dashboard")
+st.set_page_config(page_title="PM2.5 Forecast Dashboard", layout="wide")
+st.title("🌆 PM2.5 Forecast Dashboard")
+st.markdown("Live PM2.5 + Weather data with 24–48h forecast and anomaly detection")
 
 # -------------------------------
-# 1️⃣ Fetch Live PM2.5 + Weather Data
+# 1️⃣ Define cities
+cities_info = {
+    "Chennai": (13.0827, 80.2707),
+    "Delhi": (28.7041, 77.1025),
+    "Hyderabad": (17.3850, 78.4867),
+    "Madurai": (9.9252, 78.1198),
+    "Mysore": (12.2958, 76.6394)
+}
+
+HOURS_HISTORY = 168  # last 7 days
+FORECAST_HOURS = 48  # 24–48h forecast
+
 # -------------------------------
-@st.cache_data(ttl=3600)
-def fetch_latest_data():
-    LAT, LON = 12.9716, 77.5946  # Bangalore example
-    HOURS_HISTORY = 48
+# 2️⃣ Fetch PM2.5 + Weather from Open-Meteo
+def fetch_open_meteo_city(lat, lon, hours=HOURS_HISTORY):
+    url = (
+        f"https://air-quality-api.open-meteo.com/v1/air-quality?"
+        f"latitude={lat}&longitude={lon}&hourly=pm2_5,temperature_2m,relative_humidity_2m,"
+        "windspeed_10m,winddirection_10m,precipitation"
+    )
     try:
-        pm25 = fetch_openaq_pm25(LAT, LON, radius_km=25, hours_history=HOURS_HISTORY)
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame({
+            "datetime": pd.to_datetime(data["hourly"]["time"], utc=True),
+            "pm2_5": data["hourly"]["pm2_5"],
+            "temperature_2m": data["hourly"]["temperature_2m"],
+            "relative_humidity_2m": data["hourly"]["relative_humidity_2m"],
+            "windspeed_10m": data["hourly"]["windspeed_10m"],
+            "winddirection_10m": data["hourly"]["winddirection_10m"],
+            "precipitation": data["hourly"]["precipitation"]
+        })
+        return df.tail(hours)
     except:
-        pm25 = fetch_open_meteo_pm25(LAT, LON, HOURS_HISTORY)
-    weather = fetch_weather(LAT, LON, HOURS_HISTORY)
-    # Merge and process features
-    df = pd.merge(pm25, weather, on='datetime', how='inner')
-    df = add_lag_features(df.set_index('datetime'))
-    return df
-
-pm25_features = fetch_latest_data()
+        return pd.DataFrame()
 
 # -------------------------------
-# 2️⃣ Generate Forecast
-# -------------------------------
-FORECAST_HORIZON = st.sidebar.slider("Forecast Horizon (hours)", 1, 48, 24)
-last_ts = pm25_features.index.max()
+# 3️⃣ Collect all cities data
+all_cities_df = []
+for city, (lat, lon) in cities_info.items():
+    st.write(f"Fetching PM2.5 + weather for {city}...")
+    df_city = fetch_open_meteo_city(lat, lon)
+    if df_city.empty:
+        st.warning(f"⚠️ Failed to fetch data for {city}")
+        continue
+    df_city["city"] = city
+    all_cities_df.append(df_city)
 
-forecast_df = recursive_forecast(
-    pipeline,        # your trained pipeline variable
-    pm25_features,
-    last_ts,
-    horizon=FORECAST_HORIZON
-)
-
-# -------------------------------
-# 3️⃣ Combine Observed + Forecast
-# -------------------------------
-obs_recent = pm25_features[['pm25']].copy()
-obs_recent = obs_recent.loc[pm25_features.index.max() - timedelta(hours=48):]
-
-forecast_df.index = pd.to_datetime(forecast_df.index)
-
-combined = pd.concat([
-    obs_recent.rename(columns={'pm25': 'Observed'}),
-    forecast_df.rename(columns={'pm25_pred': 'Forecast'})
-], axis=1)
+final_df = pd.concat(all_cities_df, ignore_index=True)
 
 # -------------------------------
-# 4️⃣ Visualization: Observed vs Forecast
-# -------------------------------
-fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=combined.index, y=combined['Observed'], mode='lines+markers',
-    name='Observed PM2.5', line=dict(color='royalblue', width=2)
-))
-fig.add_trace(go.Scatter(
-    x=combined.index, y=combined['Forecast'], mode='lines+markers',
-    name='Forecast PM2.5', line=dict(color='orange', width=2, dash='dot')
-))
-# Highlight anomalies
-threshold = 90
-anomalies = forecast_df[forecast_df['pm25_pred'] > threshold]
-if not anomalies.empty:
-    fig.add_trace(go.Scatter(
-        x=anomalies.index, y=anomalies['pm25_pred'], mode='markers',
-        name='High PM2.5 (>90)', marker=dict(color='red', size=8, symbol='x')
-    ))
+# 4️⃣ Sidebar: select city
+selected_city = st.sidebar.selectbox("Select City:", list(cities_info.keys()))
+city_df = final_df[final_df["city"] == selected_city].reset_index(drop=True)
 
-st.subheader("Observed vs Forecast PM2.5")
+# -------------------------------
+# 5️⃣ Feature Engineering
+# Lag features for model
+lags = [1, 2, 3, 6, 12, 24]
+for lag in lags:
+    city_df[f"pm2_5_lag_{lag}"] = city_df["pm2_5"].shift(lag)
+city_df = city_df.dropna().reset_index(drop=True)
+
+feature_cols = ["pm2_5_lag_1","pm2_5_lag_2","pm2_5_lag_3","pm2_5_lag_6","pm2_5_lag_12","pm2_5_lag_24",
+                "temperature_2m","relative_humidity_2m","windspeed_10m","winddirection_10m","precipitation"]
+target_col = "pm2_5"
+
+X = city_df[feature_cols].fillna(0)
+y = city_df[target_col]
+
+# -------------------------------
+# 6️⃣ Train Gradient Boosting Regressor
+model = GradientBoostingRegressor(n_estimators=200, max_depth=3, random_state=42)
+model.fit(X, y)
+
+# Feature importance
+feature_importance = pd.DataFrame({
+    "feature": feature_cols,
+    "importance": model.feature_importances_
+}).sort_values("importance", ascending=False)
+
+# -------------------------------
+# 7️⃣ Forecasting next 48h recursively
+last_row = city_df.iloc[-1:].copy()
+forecast_list = []
+
+for h in range(1, FORECAST_HOURS + 1):
+    X_pred = last_row[feature_cols].fillna(0)
+    y_pred = model.predict(X_pred)[0]
+    forecast_list.append(y_pred)
+    
+    # Update lags for next hour
+    for lag in reversed(lags):
+        if lag == 1:
+            last_row[f"pm2_5_lag_{lag}"] = y_pred
+        else:
+            last_row[f"pm2_5_lag_{lag}"] = last_row[f"pm2_5_lag_{lag-1}"]
+
+forecast_df = pd.DataFrame({
+    "datetime": [city_df["datetime"].iloc[-1] + timedelta(hours=i) for i in range(1, FORECAST_HOURS+1)],
+    "pm2_5_forecast": forecast_list
+})
+
+# -------------------------------
+# 8️⃣ Anomaly detection on PM2.5
+iso = IsolationForest(contamination=0.05, random_state=42)
+city_df["anomaly"] = iso.fit_predict(city_df[["pm2_5"]])
+city_df["anomaly"] = city_df["anomaly"].apply(lambda x: True if x==-1 else False)
+
+# -------------------------------
+# 9️⃣ Display last observed PM2.5
+st.subheader(f"{selected_city} - Last Observed PM2.5")
+st.metric(label="PM2.5 (µg/m³)", value=round(city_df["pm2_5"].iloc[-1], 1))
+
+# -------------------------------
+# 10️⃣ Plot PM2.5 + Forecast + Anomalies
+fig = px.line(city_df, x="datetime", y="pm2_5", title=f"{selected_city} PM2.5 History & Forecast")
+fig.add_scatter(x=forecast_df["datetime"], y=forecast_df["pm2_5_forecast"], mode="lines", name="Forecast")
+fig.add_scatter(x=city_df[city_df["anomaly"]]["datetime"], 
+                y=city_df[city_df["anomaly"]]["pm2_5"], 
+                mode="markers", name="Anomaly", marker=dict(color="red", size=8))
 st.plotly_chart(fig, use_container_width=True)
 
 # -------------------------------
-# 5️⃣ Summary Metrics
-# -------------------------------
-overlap = combined.dropna(subset=['Observed', 'Forecast'])
-if len(overlap) > 0:
-    mae = mean_absolute_error(overlap['Observed'], overlap['Forecast'])
-    st.metric("Mean Absolute Error (MAE)", f"{mae:.2f} µg/m³")
-
-st.write("📈 Forecast Summary Statistics:")
-st.write(f"- Average Forecast: {forecast_df['pm25_pred'].mean():.2f} µg/m³")
-st.write(f"- Max Forecast: {forecast_df['pm25_pred'].max():.2f} µg/m³")
-st.write(f"- Min Forecast: {forecast_df['pm25_pred'].min():.2f} µg/m³")
+# 11️⃣ Feature importance chart
+st.subheader("Feature Importance")
+fig_feat = px.bar(feature_importance, x="importance", y="feature", orientation="h")
+st.plotly_chart(fig_feat, use_container_width=True)
 
 # -------------------------------
-# 6️⃣ Feature Importance
-# -------------------------------
-importances = pipeline.named_steps['gradientboostingregressor'].feature_importances_
-feature_cols = pm25_features.drop(columns=['pm25']).columns.tolist()
-feature_importance = pd.DataFrame({'feature': feature_cols, 'importance': importances})
-feature_importance = feature_importance.sort_values(by='importance', ascending=False)
+# 12️⃣ Validation Metrics (MAE, coverage %)
+y_pred_train = model.predict(X)
+mae = mean_absolute_error(y, y_pred_train)
+coverage = round(100 * (~X.isna()).all(axis=1).mean(), 2)
 
-st.subheader("Top Features Affecting PM2.5 Prediction")
-st.bar_chart(feature_importance.set_index('feature').head(10))
-
-# -------------------------------
-# 7️⃣ Download Forecast CSV
-# -------------------------------
-st.download_button(
-    label="Download Forecast CSV",
-    data=forecast_df.to_csv(index=True),
-    file_name='pm25_forecast.csv',
-    mime='text/csv'
-)
+st.subheader("Model Validation Metrics")
+st.write(f"MAE on training set: {mae:.2f}")
+st.write(f"Coverage of valid PM2.5 readings: {coverage}%")
+st.write(f"Forecast horizon: {FORECAST_HOURS} hours")
