@@ -4,11 +4,8 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.ensemble import GradientBoostingRegressor, IsolationForest
 from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
-import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="PM2.5 Forecast Dashboard", layout="wide")
 
@@ -25,7 +22,6 @@ HOURS_HISTORY = 168  # Last 7 days
 # --- Fetch PM2.5 + weather from Open-Meteo API ---
 @st.cache_data(ttl=3600)
 def fetch_pm25_weather(lat, lon, hours=HOURS_HISTORY):
-    """Fetch PM2.5 + weather data from Open-Meteo API."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
     
@@ -83,7 +79,6 @@ df_all = df_all.groupby("city").apply(create_lag_features).reset_index(drop=True
 # --- Split features/target ---
 features = ["pm2_5_lag1", "pm2_5_lag2", "pm2_5_lag3", "temperature_2m", 
             "relative_humidity_2m", "windspeed_10m", "winddirection_10m", "precipitation"]
-
 target = "pm2_5"
 
 X = df_all[features]
