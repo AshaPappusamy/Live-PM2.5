@@ -9,7 +9,7 @@ from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="PM2.5 Forecast Dashboard", layout="wide")
 
-# --- Cities ---
+# -------------------- Cities --------------------
 CITIES = {
     "Chennai": (13.0827, 80.2707),
     "Delhi": (28.7041, 77.1025),
@@ -18,14 +18,11 @@ CITIES = {
     "Mysore": (12.2958, 76.6394)
 }
 
-HOURS_HISTORY = 168  # last 7 days
+HOURS_HISTORY = 168  # 7 days
 
-# --- Fetch PM2.5 + weather from Open-Meteo ---
+# -------------------- Data Fetch --------------------
 @st.cache_data(ttl=3600)
 def fetch_pm25_weather(lat, lon, hours=HOURS_HISTORY):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=hours)
-
     url = (
         "https://air-quality-api.open-meteo.com/v1/air-quality?"
         f"latitude={lat}&longitude={lon}"
@@ -49,19 +46,18 @@ def fetch_pm25_weather(lat, lon, hours=HOURS_HISTORY):
             "precipitation": data["precipitation"]
         })
 
-        df = df.tail(hours).reset_index(drop=True)
-        return df
+        return df.tail(hours).reset_index(drop=True)
 
     except Exception as e:
-        st.warning(f"⚠️ Failed to fetch data: {e}")
+        st.warning(f"⚠️ Data fetch failed: {e}")
         return pd.DataFrame()
 
 
-# --- Load data for all cities ---
+# -------------------- Load Data --------------------
 all_data = []
 
 for city, (lat, lon) in CITIES.items():
-    st.write(f"Fetching PM2.5 + weather for {city}...")
+    st.write(f"Fetching data for {city}...")
     city_df = fetch_pm25_weather(lat, lon)
 
     if not city_df.empty:
@@ -69,26 +65,28 @@ for city, (lat, lon) in CITIES.items():
         all_data.append(city_df)
 
 if not all_data:
-    st.error("❌ No data available. Exiting.")
+    st.error("❌ No data available from API")
     st.stop()
 
 df_all = pd.concat(all_data, ignore_index=True)
 
 
-# --- Feature engineering ---
-def create_lag_features(df, lags=[1, 2, 3]):
-    df = df.sort_values("datetime").reset_index(drop=True)
-    for lag in lags:
-        df[f"pm2_5_lag{lag}"] = df["pm2_5"].shift(lag)
-    return df.dropna().reset_index(drop=True)
+# -------------------- Feature Engineering --------------------
+def create_lag_features(df):
+    df = df.sort_values("datetime")
+    df["pm2_5_lag1"] = df["pm2_5"].shift(1)
+    df["pm2_5_lag2"] = df["pm2_5"].shift(2)
+    df["pm2_5_lag3"] = df["pm2_5"].shift(3)
+    return df.dropna()
 
 df_all = (
     df_all
     .groupby("city", group_keys=False)
     .apply(create_lag_features)
+    .reset_index(drop=True)
 )
 
-# --- Features & target ---
+# -------------------- Features --------------------
 features = [
     "pm2_5_lag1", "pm2_5_lag2", "pm2_5_lag3",
     "temperature_2m", "relative_humidity_2m",
@@ -100,76 +98,79 @@ target = "pm2_5"
 X = df_all[features]
 y = df_all[target]
 
-# --- 🔴 CRITICAL FIX FOR STREAMLIT CLOUD ---
+# -------------------- 🔴 CRITICAL CLOUD FIX --------------------
+# Force numeric (API sometimes returns strings/nulls)
+X = X.apply(pd.to_numeric, errors="coerce")
+
+# Remove invalid rows
 X = X.replace([np.inf, -np.inf], np.nan)
 X = X.dropna()
+
+# Align target
 y = y.loc[X.index]
 
-# --- Scale features ---
+# Stop if no usable data
+if X.empty or len(X) < 10:
+    st.error("❌ Not enough clean data to train model. Please try later.")
+    st.stop()
+
+# -------------------- Scaling --------------------
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# --- Train model ---
-st.write("Training Gradient Boosting Regressor...")
-gb_model = GradientBoostingRegressor(
+# -------------------- Model Training --------------------
+st.write("Training Gradient Boosting model...")
+model = GradientBoostingRegressor(
     n_estimators=200,
     learning_rate=0.1,
     max_depth=3,
     random_state=42
 )
-gb_model.fit(X_scaled, y)
-st.success("✅ Model trained successfully")
+model.fit(X_scaled, y)
+st.success("✅ Model trained")
 
-# --- Next hour prediction ---
-next_input = X_scaled[-1].reshape(1, -1)
-next_hour_forecast = gb_model.predict(next_input)[0]
+# -------------------- Forecast --------------------
+next_hour = model.predict(X_scaled[-1].reshape(1, -1))[0]
 
-# --- Recursive 24-hour forecast ---
 forecast_hours = 24
-forecast_list = []
-
+forecast = []
 last_row = X_scaled[-1].copy()
 
 for _ in range(forecast_hours):
-    pred = gb_model.predict(last_row.reshape(1, -1))[0]
-    forecast_list.append(pred)
-
-    # shift lag values
+    pred = model.predict(last_row.reshape(1, -1))[0]
+    forecast.append(pred)
     last_row[0] = last_row[1]
     last_row[1] = last_row[2]
     last_row[2] = pred
 
-
-# --- Anomaly detection ---
+# -------------------- Anomaly Detection --------------------
 iso = IsolationForest(contamination=0.05, random_state=42)
 df_all["anomaly"] = iso.fit_predict(df_all[["pm2_5"]])
 anomalies = df_all[df_all["anomaly"] == -1]
 
-# --- Dashboard ---
+# -------------------- Dashboard --------------------
 st.title("🌫️ PM2.5 Forecast Dashboard")
 
 st.metric("Last Observed PM2.5", f"{df_all['pm2_5'].iloc[-1]:.1f}")
-st.metric("Next Hour Forecast", f"{next_hour_forecast:.1f}")
+st.metric("Next Hour Forecast", f"{next_hour:.1f}")
 
-st.subheader("📈 24-Hour PM2.5 Forecast")
+st.subheader("📈 24-Hour Forecast")
 forecast_df = pd.DataFrame({
     "datetime": pd.date_range(
         df_all["datetime"].iloc[-1] + pd.Timedelta(hours=1),
         periods=forecast_hours,
         freq="H"
     ),
-    "pm2_5_forecast": forecast_list
+    "PM2.5": forecast
 })
-
 st.line_chart(forecast_df.set_index("datetime"))
 
-st.subheader("🚨 Detected Anomalies")
+st.subheader("🚨 Anomalies")
 st.dataframe(anomalies[["datetime", "city", "pm2_5"]])
 
 st.subheader("🧠 Feature Importance")
-feat_imp = pd.DataFrame({
-    "feature": features,
-    "importance": gb_model.feature_importances_
-}).sort_values("importance", ascending=False)
-
-st.bar_chart(feat_imp.set_index("feature"))
+importance = pd.DataFrame({
+    "Feature": features,
+    "Importance": model.feature_importances_
+}).sort_values("Importance", ascending=False)
+st.bar_chart(importance.set_index("Feature"))
